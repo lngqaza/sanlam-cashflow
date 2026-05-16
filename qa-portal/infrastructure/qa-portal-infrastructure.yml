@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'QA Portal Infrastructure - API Gateway, Lambda, DynamoDB, S3, CloudFront'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+
+Resources:
+  # ==================== S3 BUCKETS ====================
+
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'sanlamconnect-qa-portal-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      Tags:
+        - Key: Application
+          Value: QA-Portal
+
+  # ==================== CLOUDFRONT DISTRIBUTION ====================
+
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: QA Portal OAI
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOAI}'
+            Action: 's3:GetObject'
+            Resource: !Sub '${DashboardBucket.Arn}/*'
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - DomainName: !GetAtt DashboardBucket.DomainName
+            Id: S3Origin
+            S3OriginConfig: {}
+            OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea3d-c35d-46eb-81d7-reeSFmxDapQQ
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+        CacheBehaviors:
+          - PathPattern: 'reports/*'
+            AllowedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea3d-c35d-46eb-81d7-reeSFmxDapQQ
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: https-only
+
+  # ==================== DYNAMODB TABLES ====================
+
+  TestRunsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: qa-portal-test-runs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: QA-Portal
+
+  TestReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: qa-portal-test-reports
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: report_id
+          AttributeType: S
+        - AttributeName: run_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: report_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: run_id-index
+          KeySchema:
+            - AttributeName: run_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Application
+          Value: QA-Portal
+
+  # ==================== CLOUDWATCH LOGS ====================
+
+  TestRunsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /qa-portal/test-runs
+      RetentionInDays: 30
+
+  # ==================== IAM ROLES ====================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                Resource:
+                  - !GetAtt TestRunsTable.Arn
+                  - !GetAtt TestReportsTable.Arn
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                  - 'logs:GetLogEvents'
+                Resource: !GetAtt TestRunsLogGroup.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:GeneratePresignedUrl'
+                Resource: !Sub '${DashboardBucket.Arn}/*'
+
+  # ==================== LAMBDA FUNCTIONS ====================
+
+  TestExecutorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qa-portal-test-executor
+      Runtime: python3.11
+      Handler: lambda_handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          TEST_RUNS_TABLE: !Ref TestRunsTable
+          LOG_GROUP: !Ref TestRunsLogGroup
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code during deployment
+          def handler(event, context):
+              return {'statusCode': 200, 'body': 'Test Executor'}
+
+  TestStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qa-portal-test-status
+      Runtime: python3.11
+      Handler: api_functions.test_status_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TEST_RUNS_TABLE: !Ref TestRunsTable
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code during deployment
+          def test_status_handler(event, context):
+              return {'statusCode': 200, 'body': 'Status'}
+
+  TestLogsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qa-portal-test-logs
+      Runtime: python3.11
+      Handler: api_functions.test_logs_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_GROUP: !Ref TestRunsLogGroup
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code during deployment
+          def test_logs_handler(event, context):
+              return {'statusCode': 200, 'body': 'Logs'}
+
+  TestHistoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qa-portal-test-history
+      Runtime: python3.11
+      Handler: api_functions.test_history_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TEST_RUNS_TABLE: !Ref TestRunsTable
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code during deployment
+          def test_history_handler(event, context):
+              return {'statusCode': 200, 'body': 'History'}
+
+  ReportGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qa-portal-report-generator
+      Runtime: python3.11
+      Handler: api_functions.report_generator_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          TEST_RUNS_TABLE: !Ref TestRunsTable
+          TEST_REPORTS_TABLE: !Ref TestReportsTable
+          S3_BUCKET: !Ref DashboardBucket
+      Code:
+        ZipFile: |
+          # Placeholder - replace with actual code during deployment
+          def report_generator_handler(event, context):
+              return {'statusCode': 200, 'body': 'Report'}
+
+  # ==================== API GATEWAY ====================
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: qa-portal-api
+      Description: QA Portal REST API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: test
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGateway
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref Environment
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      LoggingLevel: INFO
+      DataTraceEnabled: true
+
+  # ==================== LAMBDA PERMISSIONS ====================
+
+  TestExecutorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TestExecutorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+Outputs:
+  DashboardUrl:
+    Description: QA Portal Dashboard URL
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: QAPortalDashboardUrl
+
+  ApiGatewayUrl:
+    Description: API Gateway Base URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: QAPortalApiUrl
+
+  S3BucketName:
+    Description: S3 Bucket for Dashboard and Reports
+    Value: !Ref DashboardBucket
+    Export:
+      Name: QAPortalS3Bucket
+
+  TestRunsTableName:
+    Description: DynamoDB TestRuns Table
+    Value: !Ref TestRunsTable
+    Export:
+      Name: QAPortalTestRunsTable
+
+  TestReportsTableName:
+    Description: DynamoDB TestReports Table
+    Value: !Ref TestReportsTable
+    Export:
+      Name: QAPortalTestReportsTable
+
+  CloudWatchLogGroupName:
+    Description: CloudWatch Log Group for Test Runs
+    Value: !Ref TestRunsLogGroup
+    Export:
+      Name: QAPortalLogGroup
