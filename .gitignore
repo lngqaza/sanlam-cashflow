@@ -1,0 +1,4 @@
+node_modules/
+.terraform/
+__pycache__/
+.pytest_cache/
